@@ -26,7 +26,7 @@
             <span class="visually-hidden">Loading dashboard...</span>
         </div>
         <h4 class="fw-bold text-dark">Connecting to Capacity Connect...</h4>
-        <p class="text-muted small">Synchronizing authoritative role credentials.</p>
+        <p class="text-muted small" id="syncStatus">Synchronizing authoritative role credentials.</p>
     </div>
 
     <!-- Supabase JS CDN -->
@@ -46,11 +46,36 @@
 
     <script>
         document.addEventListener('DOMContentLoaded', async () => {
-            const profile = await Auth.fetchDjangoProfile();
+            const statusEl = document.getElementById('syncStatus');
+            
+            // Check Supabase session first
+            const isAuth = await Auth.isAuthenticated();
+            if (!isAuth) {
+                window.location.href = '/pages/login.html?redirect=/pages/dashboard.html';
+                return;
+            }
+
+            // Attempt profile fetch with retry for cold start resilience
+            let profile = null;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    profile = await Auth.fetchDjangoProfile();
+                    if (profile) break;
+                } catch (err) {
+                    console.warn(`[Dashboard Router] Attempt ${attempt} failed:`, err);
+                }
+
+                if (attempt < 3) {
+                    if (statusEl) statusEl.textContent = `Connecting to server services (attempt ${attempt + 1})...`;
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+            }
+
             if (!profile) {
                 window.location.href = '/pages/login.html?redirect=/pages/dashboard.html';
                 return;
             }
+
             Dashboard.redirectToRoleDashboard(profile.role);
         });
     </script>
