@@ -278,26 +278,48 @@ if not DEBUG:
 # This MUST be set to False in production. Use CORS_ALLOWED_ORIGINS instead.
 # ---------------------------------------------------------------------------
 
-CORS_ALLOW_ALL_ORIGINS = DEBUG  # Only allow all origins when DEBUG is True
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 CORS_ALLOW_CREDENTIALS = True
 
-CORS_ALLOWED_ORIGINS = [
+# Always include the production frontend. Environment values are appended so a
+# missing or incorrectly applied Render variable cannot silently break login.
+DEFAULT_CORS_ORIGINS = [
+    'https://capacity-connect-orpin.vercel.app',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    'http://127.0.0.1:5500',
+    'http://localhost:5500',
+    'http://localhost:3000',
+]
+
+ENV_CORS_ORIGINS = [
     origin.strip()
-    for origin in os.getenv(
-        'CORS_ALLOWED_ORIGINS',
-        'http://localhost:8000,http://127.0.0.1:8000,http://127.0.0.1:5500,http://localhost:5500,http://localhost:3000',
-    ).split(',')
+    for origin in os.getenv('CORS_ALLOWED_ORIGINS', '').split(',')
     if origin.strip()
 ]
 
-CSRF_TRUSTED_ORIGINS = [
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys(
+    DEFAULT_CORS_ORIGINS + ENV_CORS_ORIGINS
+))
+
+DEFAULT_CSRF_ORIGINS = [
+    'https://capacity-connect-orpin.vercel.app',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    'http://127.0.0.1:5500',
+    'http://localhost:5500',
+    'http://localhost:3000',
+]
+
+ENV_CSRF_ORIGINS = [
     origin.strip()
-    for origin in os.getenv(
-        'CSRF_TRUSTED_ORIGINS',
-        'http://localhost:8000,http://127.0.0.1:8000,http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000',
-    ).split(',')
+    for origin in os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',')
     if origin.strip()
 ]
+
+CSRF_TRUSTED_ORIGINS = list(dict.fromkeys(
+    DEFAULT_CSRF_ORIGINS + ENV_CSRF_ORIGINS
+))
 
 # ---------------------------------------------------------------------------
 # Email
