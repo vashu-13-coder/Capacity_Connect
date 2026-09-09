@@ -1,8 +1,7 @@
 /**
  * Capacity Connect — Authentication UI & State Controller
  *
- * Orchestrates Supabase Auth client operations with Django application identity.
- * Authoritative user roles are always fetched from Django (/api/auth/me/).
+ * Supports Supabase accounts and Django username/password accounts.
  */
 
 'use strict';
@@ -10,10 +9,6 @@
 const Auth = {
     _currentUser: null,
 
-    /**
-     * Fetch authoritative user profile from Django MySQL backend.
-     * @returns {Promise<object|null>} Django user object { id, username, email, role, supabase_uid }
-     */
     async fetchDjangoProfile() {
         try {
             const user = await apiRequest('/auth/me/');
@@ -25,61 +20,103 @@ const Auth = {
         }
     },
 
-    /**
-     * Get cached current user object (or null if unauthenticated).
-     */
     getUser() {
         return this._currentUser;
     },
 
-    /**
-     * Check if user is currently authenticated with active Supabase session.
-     */
     async isAuthenticated() {
+        const djangoToken = localStorage.getItem('cc_django_token');
+        if (djangoToken) return true;
+
         if (!window.SupabaseAuth) return false;
         const session = await window.SupabaseAuth.getSession();
         return !!(session && session.access_token);
     },
 
-    /**
-     * Sign in with Supabase Auth and fetch authoritative Django profile.
-     */
-    async login(email, password) {
-        if (!window.SupabaseAuth) throw new Error('Supabase Auth client not initialized.');
-        const result = await window.SupabaseAuth.signIn(email, password);
-        const profile = await this.fetchDjangoProfile();
-        return { session: result.session, profile };
-    },
+    async login(usernameOrEmail, password) {
+        if (window.SupabaseAuth && usernameOrEmail.includes('@')) {
+            try {
+                const result = await window.SupabaseAuth.signIn(
+                    usernameOrEmail,
+                    password
+                );
+                const profile = await this.fetchDjangoProfile();
 
-    /**
-     * Register new Trainee or Trainer with Supabase Auth.
-     */
-    async register(email, password, username, role) {
-        if (!window.SupabaseAuth) throw new Error('Supabase Auth client not initialized.');
-        const cleanRole = (role === 'TRAINER') ? 'TRAINER' : 'TRAINEE';
-        return await window.SupabaseAuth.signUp(email, password, username, cleanRole);
-    },
-
-    /**
-     * Sign out and refresh UI state.
-     */
-    async logout() {
-        if (window.SupabaseAuth) {
-            await window.SupabaseAuth.signOut();
+                if (profile) {
+                    return {
+                        type: 'supabase',
+                        session: result.session,
+                        profile,
+                    };
+                }
+            } catch (error) {
+                console.info(
+                    '[Auth] Supabase login failed; trying Django login.'
+                );
+            }
         }
+
+        const response = await apiRequest('/auth/login/', {
+            method: 'POST',
+            skipAuth: true,
+            body: JSON.stringify({
+                username: usernameOrEmail,
+                password,
+            }),
+        });
+
+        if (!response.token || !response.user) {
+            throw new Error('Authentication failed.');
+        }
+
+        localStorage.setItem('cc_django_token', response.token);
+        this._currentUser = response.user;
+
+        return {
+            type: 'django',
+            profile: response.user,
+        };
+    },
+
+    async register(email, password, username, role) {
+        if (!window.SupabaseAuth) {
+            throw new Error('Supabase Auth client not initialized.');
+        }
+
+        const cleanRole = role === 'TRAINER' ? 'TRAINER' : 'TRAINEE';
+        return await window.SupabaseAuth.signUp(
+            email,
+            password,
+            username,
+            cleanRole
+        );
+    },
+
+    async logout() {
+        localStorage.removeItem('cc_django_token');
+
+        if (window.SupabaseAuth) {
+            try {
+                await window.SupabaseAuth.signOut();
+            } catch (error) {
+                console.warn('Supabase logout failed:', error);
+            }
+        }
+
         this._currentUser = null;
         this.updateNavbar(null);
         window.location.href = '/index.html';
     },
 
-    /**
-     * Initialize navbar and dynamic elements across any page.
-     */
     async initNavbar() {
-        const navContainer = document.getElementById('navbarNav') || document.querySelector('.navbar-nav');
+        const navContainer =
+            document.getElementById('navbarNav') ||
+            document.querySelector('.navbar-nav');
+
         if (!navContainer) return;
 
         const isAuth = await this.isAuthenticated();
+
         if (isAuth) {
             const profile = await this.fetchDjangoProfile();
             this.updateNavbar(profile);
@@ -87,13 +124,17 @@ const Auth = {
             this.updateNavbar(null);
         }
 
-        // Listen to Supabase auth state changes
         if (window.SupabaseAuth) {
-            window.SupabaseAuth.onAuthStateChange(async (event, session) => {
+            window.SupabaseAuth.onAuthStateChange(async (event) => {
                 if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
-                    const profile = await this.fetchDjangoProfile();
-                    this.updateNavbar(profile);
-                } else if (event === 'SIGNED_OUT') {
+                    if (!localStorage.getItem('cc_django_token')) {
+                        const profile = await this.fetchDjangoProfile();
+                        this.updateNavbar(profile);
+                    }
+                } else if (
+                    event === 'SIGNED_OUT' &&
+                    !localStorage.getItem('cc_django_token')
+                ) {
                     this._currentUser = null;
                     this.updateNavbar(null);
                 }
@@ -101,15 +142,20 @@ const Auth = {
         }
     },
 
-    /**
-     * Dynamically render navigation items based on authentication state and role.
-     */
     updateNavbar(user) {
         const navList = document.getElementById('navbarLinks');
         if (!navList) return;
 
         if (user) {
-            const roleBadgeClass = user.role === 'ADMIN' ? 'bg-danger text-white' : (user.role === 'TRAINER' ? 'bg-warning text-dark' : 'bg-info text-dark');
+            const roleBadgeClass =
+                user.role === 'ADMIN'
+                    ? 'bg-danger text-white'
+                    : (
+                        user.role === 'TRAINER'
+                            ? 'bg-warning text-dark'
+                            : 'bg-info text-dark'
+                    );
+
             navList.innerHTML = `
                 <li class="nav-item">
                     <a class="nav-link" href="/index.html"><i class="bi bi-house-door me-1"></i>Home</a>
@@ -124,7 +170,7 @@ const Auth = {
                         <span class="badge ${roleBadgeClass} ms-2">${user.role}</span>
                     </a>
                     <ul class="dropdown-menu dropdown-menu-end shadow-sm">
-                        <li><h6 class="dropdown-header">${user.email}</h6></li>
+                        <li><h6 class="dropdown-header">${user.email || user.username}</h6></li>
                         <li>
                             <a class="dropdown-item" href="/pages/dashboard.html">
                                 <i class="bi bi-speedometer2 me-2"></i>My Dashboard
@@ -158,24 +204,32 @@ const Auth = {
         }
     },
 
-    /**
-     * Route guard: redirect to login if not authenticated.
-     */
     async requireAuth(allowedRoles = []) {
         const isAuth = await this.isAuthenticated();
+
         if (!isAuth) {
-            window.location.href = `/pages/login.html?redirect=${encodeURIComponent(window.location.pathname)}`;
+            window.location.href =
+                `/pages/login.html?redirect=${encodeURIComponent(
+                    window.location.pathname
+                )}`;
             return false;
         }
 
         const profile = await this.fetchDjangoProfile();
+
         if (!profile) {
+            localStorage.removeItem('cc_django_token');
             window.location.href = '/pages/login.html';
             return false;
         }
 
-        if (allowedRoles.length > 0 && !allowedRoles.includes(profile.role)) {
-            alert(`Access denied. This page requires one of the following roles: ${allowedRoles.join(', ')}`);
+        if (
+            allowedRoles.length > 0 &&
+            !allowedRoles.includes(profile.role)
+        ) {
+            alert(
+                `Access denied. This page requires one of the following roles: ${allowedRoles.join(', ')}`
+            );
             window.location.href = '/pages/dashboard.html';
             return false;
         }
@@ -183,24 +237,21 @@ const Auth = {
         return true;
     },
 
-    /**
-     * Redirect authenticated users away from Login and Register pages.
-     */
     async redirectIfAuthenticated() {
         const isAuth = await this.isAuthenticated();
+
         if (isAuth) {
             const profile = await this.fetchDjangoProfile();
+
             if (profile) {
                 window.location.href = '/pages/dashboard.html';
             }
         }
-    }
+    },
 };
 
-// Global export
 window.Auth = Auth;
 
-// Auto-initialize navbar on DOM ready
 document.addEventListener('DOMContentLoaded', () => {
     Auth.initNavbar();
 });

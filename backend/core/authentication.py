@@ -5,15 +5,14 @@ Verifies Supabase JWT access tokens using either:
 1. Asymmetric JWKS (RS256/ES256) via Supabase's .well-known/jwks.json endpoint
 2. Symmetric JWT Secret (HS256) via settings.SUPABASE_JWT_SECRET
 
-Enforces strict role sanitization: public registrations are restricted to TRAINEE
-or TRAINER. ADMIN role can NEVER be claimed through public signup or JWT metadata.
+Also supports signed Capacity Connect Django tokens for local admin/password login.
 """
 
 import logging
 import uuid
 import jwt
 from django.conf import settings
-from django.contrib.auth import get_user_model
+from django.core import signing
 from django.contrib.auth.models import User
 from rest_framework.authentication import BaseAuthentication, get_authorization_header
 from rest_framework.exceptions import AuthenticationFailed
@@ -22,11 +21,8 @@ from .models import Role, UserProfile
 
 logger = logging.getLogger(__name__)
 
-# Cache for JWKS client to avoid recreating on every request
 _jwks_client = None
 
-
-# Strictly allowed token signing algorithms
 ALLOWED_ALGORITHMS = {'RS256', 'ES256', 'HS256'}
 
 
@@ -41,9 +37,7 @@ def get_jwks_client():
 
 
 class SupabaseAuthentication(BaseAuthentication):
-    """
-    DRF Authentication class for Supabase JWT access tokens.
-    """
+    """DRF authentication for Supabase JWTs and Capacity Connect Django tokens."""
 
     keyword = 'Bearer'
 
@@ -58,25 +52,46 @@ class SupabaseAuthentication(BaseAuthentication):
 
         if len(auth_header) == 1:
             raise AuthenticationFailed('Invalid token header. No credentials provided.')
-        elif len(auth_header) > 2:
+        if len(auth_header) > 2:
             raise AuthenticationFailed('Invalid token header. Token string should not contain spaces.')
 
         token = auth_header[1].decode()
         return self.authenticate_credentials(token)
 
     def authenticate_credentials(self, token: str):
+        """Authenticate either a Capacity Connect token or a Supabase JWT."""
+        if token.startswith('cc1.'):
+            return self.authenticate_django_token(token)
+
         payload = self.decode_and_verify_token(token)
         user = self.get_or_create_user(payload)
         return (user, token)
 
+    def authenticate_django_token(self, token: str):
+        """Authenticate a Django user using a signed Capacity Connect token."""
+        try:
+            signed_token = token.removeprefix('cc1.')
+            payload = signing.loads(
+                signed_token,
+                salt='capacity-connect-auth',
+                max_age=60 * 60 * 24 * 7,
+            )
+            user_id = payload.get('user_id')
+            if not user_id:
+                raise AuthenticationFailed('Invalid authentication token.')
+
+            user = User.objects.filter(id=user_id, is_active=True).first()
+            if not user:
+                raise AuthenticationFailed('User not found or inactive.')
+
+            return (user, token)
+        except signing.SignatureExpired:
+            raise AuthenticationFailed('Authentication token has expired.')
+        except signing.BadSignature:
+            raise AuthenticationFailed('Invalid authentication token.')
+
     def decode_and_verify_token(self, token: str) -> dict:
-        """
-        Cryptographically decodes and validates the Supabase JWT.
-        Strictly routes verification based on the declared algorithm:
-        - RS256/ES256: verified ONLY via Supabase JWKS public keys. Never falls back to HS256 secret.
-        - HS256: verified ONLY via settings.SUPABASE_JWT_SECRET when configured.
-        - Any other algorithm or alg='none': rejected immediately.
-        """
+        """Cryptographically decode and validate a Supabase JWT."""
         try:
             unverified_header = jwt.get_unverified_header(token)
             alg = unverified_header.get('alg')
@@ -99,13 +114,11 @@ class SupabaseAuthentication(BaseAuthentication):
             },
         }
 
-        # Validate issuer if SUPABASE_URL is configured
         if supabase_url:
             expected_issuer = f"{supabase_url.rstrip('/')}/auth/v1"
             decode_kwargs['issuer'] = expected_issuer
             decode_kwargs['options']['verify_iss'] = True
 
-        # Branch 1: Asymmetric algorithms (RS256, ES256) via JWKS ONLY
         if alg in ['RS256', 'ES256']:
             if not supabase_url:
                 raise AuthenticationFailed('JWKS verification failed: SUPABASE_URL is not configured.')
@@ -114,8 +127,7 @@ class SupabaseAuthentication(BaseAuthentication):
                 if not client:
                     raise AuthenticationFailed('JWKS client is not initialized.')
                 signing_key = client.get_signing_key_from_jwt(token)
-                payload = jwt.decode(token, signing_key.key, **decode_kwargs)
-                return payload
+                return jwt.decode(token, signing_key.key, **decode_kwargs)
             except jwt.ExpiredSignatureError:
                 raise AuthenticationFailed('Token has expired.')
             except jwt.InvalidAudienceError:
@@ -131,15 +143,13 @@ class SupabaseAuthentication(BaseAuthentication):
             except Exception as e:
                 raise AuthenticationFailed(f'Asymmetric token verification failed: {str(e)}')
 
-        # Branch 2: Symmetric algorithm (HS256) via SUPABASE_JWT_SECRET ONLY
         if alg == 'HS256':
             if not jwt_secret:
                 raise AuthenticationFailed(
                     'Supabase authentication is not configured on the server. Missing SUPABASE_JWT_SECRET.'
                 )
             try:
-                payload = jwt.decode(token, jwt_secret, **decode_kwargs)
-                return payload
+                return jwt.decode(token, jwt_secret, **decode_kwargs)
             except jwt.ExpiredSignatureError:
                 raise AuthenticationFailed('Token has expired.')
             except jwt.InvalidAudienceError:
@@ -155,13 +165,8 @@ class SupabaseAuthentication(BaseAuthentication):
 
         raise AuthenticationFailed(f'Unhandled token algorithm: {alg}')
 
-
     def get_or_create_user(self, payload: dict) -> User:
-        """
-        Resolves the Django User and UserProfile from the verified token payload.
-        Auto-provisions a new user in MySQL if no user matches supabase_uid.
-        Enforces strict role sanitization (ADMIN role can never be auto-provisioned).
-        """
+        """Resolve or auto-provision a Django user from a verified Supabase token."""
         sub = payload.get('sub')
         if not sub:
             raise AuthenticationFailed('Token payload missing subject identifier (sub).')
@@ -171,29 +176,26 @@ class SupabaseAuthentication(BaseAuthentication):
         except (ValueError, AttributeError):
             raise AuthenticationFailed('Invalid Supabase user UUID format.')
 
-        # 1. Authoritative primary lookup by supabase_uid
         profile = UserProfile.objects.filter(supabase_uid=supabase_uuid).select_related('user').first()
         if profile and profile.user:
             return profile.user
 
-        # 2. Auto-provisioning a new user
         email = payload.get('email', '').strip()
         user_metadata = payload.get('user_metadata', {}) or {}
 
-        # Strict role sanitization: only TRAINEE and TRAINER allowed; ADMIN is strictly sanitized to TRAINEE
         raw_role = str(user_metadata.get('role', '')).upper()
         if raw_role == Role.TRAINER:
             assigned_role = Role.TRAINER
         elif raw_role == Role.TRAINEE:
             assigned_role = Role.TRAINEE
         else:
-            assigned_role = Role.TRAINEE  # Default/fallback, blocks ADMIN and invalid roles
+            assigned_role = Role.TRAINEE
 
-        # Generate a clean username
-        raw_username = user_metadata.get('username') or (email.split('@')[0] if email else f'user_{str(supabase_uuid)[:8]}')
+        raw_username = user_metadata.get('username') or (
+            email.split('@')[0] if email else f'user_{str(supabase_uuid)[:8]}'
+        )
         username = raw_username.strip()
 
-        # Handle username collisions
         if User.objects.filter(username=username).exists():
             username = f"{username}_{str(supabase_uuid)[:4]}"
             counter = 1
@@ -201,22 +203,20 @@ class SupabaseAuthentication(BaseAuthentication):
                 username = f"{raw_username}_{str(supabase_uuid)[:4]}_{counter}"
                 counter += 1
 
-        # Create Django User with unusable password (auth delegated to Supabase)
-        user = User(
-            username=username,
-            email=email,
-        )
+        user = User(username=username, email=email)
         user.set_unusable_password()
         user.save()
 
-        # Create linked UserProfile
         UserProfile.objects.create(
             user=user,
             role=assigned_role,
             supabase_uid=supabase_uuid,
         )
 
-        logger.info(f"Auto-provisioned new {assigned_role} user '{username}' (Supabase UID: {supabase_uuid})")
+        logger.info(
+            f"Auto-provisioned new {assigned_role} user '{username}' "
+            f"(Supabase UID: {supabase_uuid})"
+        )
         return user
 
     def authenticate_header(self, request):

@@ -3,7 +3,7 @@ services:
     name: capacity-connect-backend
     runtime: python
     buildCommand: "bash backend/build.sh"
-    startCommand: "gunicorn --chdir backend config.wsgi:application --bind 0.0.0.0:$PORT --workers 4 --threads 2 --timeout 60"
+    startCommand: "python backend/manage.py migrate --noinput && python backend/manage.py bootstrap_admin && gunicorn --chdir backend config.wsgi:application --bind 0.0.0.0:$PORT --workers 4 --threads 2 --timeout 60"
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
@@ -22,4 +22,10 @@ services:
       - key: SUPABASE_URL
         value: "https://jnevchtixesdwwkbjkez.supabase.co"
       - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: DJANGO_ADMIN_USERNAME
+        value: "Admin"
+      - key: DJANGO_ADMIN_EMAIL
+        sync: false
+      - key: DJANGO_ADMIN_PASSWORD
         sync: false

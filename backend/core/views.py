@@ -2,11 +2,11 @@
 Views for the core authentication module.
 
 Provides Register, Login, Logout, and CurrentUser API views.
-Aligned with Supabase Bearer token architecture without creating competing API sessions.
 """
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
+from django.core import signing
 from django.db.models import Q
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -15,17 +15,18 @@ from rest_framework.views import APIView
 
 from .models import Role
 from .permissions import IsAdmin
-from .serializers import LoginSerializer, RegisterSerializer, UserSerializer, AdminUserListSerializer, AdminUserDetailSerializer
+from .serializers import (
+    LoginSerializer,
+    RegisterSerializer,
+    UserSerializer,
+    AdminUserListSerializer,
+    AdminUserDetailSerializer,
+)
 from .throttling import AuthRateThrottle
 
 
 class RegisterView(APIView):
-    """
-    POST /api/auth/register/
-
-    Creates a new user with a UserProfile. Public endpoint.
-    Only TRAINEE and TRAINER roles are allowed.
-    """
+    """Create a public Trainee or Trainer account."""
     permission_classes = [AllowAny]
     throttle_classes = [AuthRateThrottle]
 
@@ -33,18 +34,14 @@ class RegisterView(APIView):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-        return Response(
-            UserSerializer(user).data,
-            status=status.HTTP_201_CREATED,
-        )
+        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
     """
     POST /api/auth/login/
 
-    Validates user credentials against Django backend.
-    Does not issue or require Django session cookies.
+    Authenticate a Django user and return a signed application token.
     """
     permission_classes = [AllowAny]
     throttle_classes = [AuthRateThrottle]
@@ -52,26 +49,38 @@ class LoginView(APIView):
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
         user = authenticate(
             request,
             username=serializer.validated_data['username'],
             password=serializer.validated_data['password'],
         )
+
         if user is None:
             return Response(
-                {'detail': 'Invalid credentials.'},
+                {'detail': 'Invalid username or password.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
-        return Response(UserSerializer(user).data)
+
+        if not user.is_active:
+            return Response(
+                {'detail': 'This account is disabled.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        signed_token = signing.dumps(
+            {'user_id': user.id},
+            salt='capacity-connect-auth',
+        )
+
+        return Response({
+            'token': f'cc1.{signed_token}',
+            'user': UserSerializer(user).data,
+        })
 
 
 class LogoutView(APIView):
-    """
-    POST /api/auth/logout/
-
-    Logs out the user in alignment with Bearer token authentication.
-    Requires valid authentication.
-    """
+    """POST /api/auth/logout/."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -79,12 +88,7 @@ class LogoutView(APIView):
 
 
 class CurrentUserView(APIView):
-    """
-    GET /api/auth/me/
-
-    Returns the current authenticated user's info and role.
-    Requires Bearer token authentication.
-    """
+    """GET /api/auth/me/."""
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -92,20 +96,16 @@ class CurrentUserView(APIView):
 
 
 class AdminUserListView(APIView):
-    """
-    GET /api/auth/admin/users/ — List all platform users with optional role and search filters.
-    """
+    """GET /api/auth/admin/users/."""
     permission_classes = [IsAuthenticated, IsAdmin]
 
     def get(self, request):
         users = User.objects.select_related('profile').all().order_by('-date_joined')
 
-        # Filter by role
         role_filter = request.query_params.get('role')
         if role_filter:
             users = users.filter(profile__role=role_filter.upper())
 
-        # Search by username or email
         search = request.query_params.get('search')
         if search:
             users = users.filter(
@@ -117,22 +117,17 @@ class AdminUserListView(APIView):
 
 
 class AdminUserDetailView(APIView):
-    """
-    GET /api/auth/admin/users/<pk>/ — Detailed user view with activity counts.
-    """
+    """GET /api/auth/admin/users/<pk>/."""
     permission_classes = [IsAuthenticated, IsAdmin]
 
     def get(self, request, pk):
         from django.shortcuts import get_object_or_404
         user = get_object_or_404(User, pk=pk)
-        serializer = AdminUserDetailSerializer(user)
-        return Response(serializer.data)
+        return Response(AdminUserDetailSerializer(user).data)
 
 
 class AdminUserDeactivateView(APIView):
-    """
-    POST /api/auth/admin/users/<pk>/deactivate/ — Deactivate a user account.
-    """
+    """POST /api/auth/admin/users/<pk>/deactivate/."""
     permission_classes = [IsAuthenticated, IsAdmin]
 
     def post(self, request, pk):
@@ -163,9 +158,7 @@ class AdminUserDeactivateView(APIView):
 
 
 class AdminUserActivateView(APIView):
-    """
-    POST /api/auth/admin/users/<pk>/activate/ — Reactivate a user account.
-    """
+    """POST /api/auth/admin/users/<pk>/activate/."""
     permission_classes = [IsAuthenticated, IsAdmin]
 
     def post(self, request, pk):
@@ -181,4 +174,3 @@ class AdminUserActivateView(APIView):
         user.is_active = True
         user.save(update_fields=['is_active'])
         return Response({'detail': f'User "{user.username}" has been reactivated.'})
-
