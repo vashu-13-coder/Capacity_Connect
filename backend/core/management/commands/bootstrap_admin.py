@@ -3,12 +3,14 @@ import os
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
 
+from core.models import Role, UserProfile
+
 
 class Command(BaseCommand):
     help = "Create or reset a Django admin user from environment variables."
 
     def handle(self, *args, **options):
-        username = os.getenv("DJANGO_ADMIN_USERNAME", "admin").strip()
+        username = os.getenv("DJANGO_ADMIN_USERNAME", "Admin").strip()
         email = os.getenv("DJANGO_ADMIN_EMAIL", "").strip()
         password = os.getenv("DJANGO_ADMIN_PASSWORD", "")
 
@@ -33,7 +35,14 @@ class Command(BaseCommand):
         user.set_password(password)
         user.save()
 
-        action = "Created" if created else "Reset"
+        UserProfile.objects.update_or_create(
+            user=user,
+            defaults={"role": Role.ADMIN},
+        )
+
+        action = "Created" if created else "Updated"
         self.stdout.write(
-            self.style.SUCCESS(f"{action} Django admin user '{username}' successfully.")
+            self.style.SUCCESS(
+                f"{action} Django admin user '{username}' successfully."
+            )
         )
